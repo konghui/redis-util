@@ -1,4 +1,4 @@
-package nodes
+package main
 
 import (
 	"gopkg.in/redis.v3"

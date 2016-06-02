@@ -1,4 +1,4 @@
-package cluster
+package main
 
 import (
 	"encoding/json"
@@ -10,8 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/konghui/redis_snapshot/common"
-	"github.com/konghui/redis_snapshot/nodes"
 	"gopkg.in/redis.v3"
 )
 
@@ -42,12 +40,12 @@ var HostType = [...]string{
 }
 
 type redisCluster struct {
-	Schema      []nodes.RedisNodes
+	Schema      []RedisNodes
 	logger      *log.Logger
 	Logfile     string
-	configNodes map[string]*nodes.RedisNodes
+	configNodes map[string]*RedisNodes
 	conn        *redis.ClusterClient
-	runNodes    map[string]*nodes.RedisNodes
+	runNodes    map[string]*RedisNodes
 }
 
 func (r *redisCluster) ConfigParser(configfile string) (err error) {
@@ -81,8 +79,8 @@ func (r *redisCluster) ParserFromHost(host string) {
 
 func RedisSnapShot(args map[string]string) (r *redisCluster) {
 	var snapShot redisCluster
-	snapShot.configNodes = make(map[string]*nodes.RedisNodes)
-	snapShot.runNodes = make(map[string]*nodes.RedisNodes)
+	snapShot.configNodes = make(map[string]*RedisNodes)
+	snapShot.runNodes = make(map[string]*RedisNodes)
 	if val, has := args["file"]; has {
 		snapShot.ParseFromFile(val)
 	} else if val, has := args["host"]; has {
@@ -94,7 +92,7 @@ func RedisSnapShot(args map[string]string) (r *redisCluster) {
 }
 
 // copy configure to the nodes
-func (r *redisCluster) registerNodes(node *nodes.RedisNodes) {
+func (r *redisCluster) registerNodes(node *RedisNodes) {
 	r.configNodes[node.IP] = node
 }
 
@@ -107,7 +105,7 @@ func (r *redisCluster) initNodes() {
 	r.FreshClusterInfo()
 }
 
-func nodeStatus(nodes map[string]*nodes.RedisNodes) {
+func nodeStatus(nodes map[string]*RedisNodes) {
 	var slot string
 	slots := make([]string, 0)
 	for _, v := range nodes {
@@ -163,7 +161,7 @@ func getIndex(str string, list []string, compare func(string, string) bool) (rv 
 	return
 }
 
-func callbackNodeInList(node *nodes.RedisNodes, args interface{}) bool {
+func callbackNodeInList(node *RedisNodes, args interface{}) bool {
 	if node.Type == Master {
 		return true
 	}
@@ -180,7 +178,7 @@ func callbackNodeInList(node *nodes.RedisNodes, args interface{}) bool {
 }
 
 // run the callback function on the all node
-func (r *redisCluster) CheckAllNode(callback func(*nodes.RedisNodes, interface{}) bool, args interface{}) bool {
+func (r *redisCluster) CheckAllNode(callback func(*RedisNodes, interface{}) bool, args interface{}) bool {
 	for _, redisNode := range r.configNodes {
 		if !callback(redisNode, args) {
 			return false
@@ -189,7 +187,7 @@ func (r *redisCluster) CheckAllNode(callback func(*nodes.RedisNodes, interface{}
 	return true
 }
 
-func Fresh(client *redis.ClusterClient, nodeList map[string]*nodes.RedisNodes) (err error) {
+func Fresh(client *redis.ClusterClient, nodeList map[string]*RedisNodes) (err error) {
 	val, err := client.ClusterNodes().Result()
 	if err != nil {
 		log.Fatal(err.Error())
@@ -209,7 +207,7 @@ func Fresh(client *redis.ClusterClient, nodeList map[string]*nodes.RedisNodes) (
 			log.Fatal(fmt.Sprintf("unknown Status %s", info[7]))
 		}
 		if len(info) == 8 { //the node info don't have any slot
-			nodeList[info[1]] = &nodes.RedisNodes{Id: info[0], IP: info[1], Type: nodeType, Master: info[3], Status: nodeStatus}
+			nodeList[info[1]] = &RedisNodes{Id: info[0], IP: info[1], Type: nodeType, Master: info[3], Status: nodeStatus}
 		} else { // the node has slot
 			slotList := make([][]int, 0)
 			for _, slot := range info[8:] {
@@ -234,12 +232,12 @@ func Fresh(client *redis.ClusterClient, nodeList map[string]*nodes.RedisNodes) (
 					slotList = append(slotList, []int{slotNum})
 				}
 			}
-			nodeList[info[1]] = &nodes.RedisNodes{Id: info[0], IP: info[1], Type: nodeType, Master: info[3], Status: nodeStatus, Slot: slotList}
+			nodeList[info[1]] = &RedisNodes{Id: info[0], IP: info[1], Type: nodeType, Master: info[3], Status: nodeStatus, Slot: slotList}
 		}
 
 	}
 
-	getNodeById := func(Id string) (rv *nodes.RedisNodes) {
+	getNodeById := func(Id string) (rv *RedisNodes) {
 		for _, node := range nodeList {
 			if node.Id == Id {
 				rv = node
@@ -260,7 +258,7 @@ func Fresh(client *redis.ClusterClient, nodeList map[string]*nodes.RedisNodes) (
 
 }
 
-func FreshThroughHost(host string, node map[string]*nodes.RedisNodes) {
+func FreshThroughHost(host string, node map[string]*RedisNodes) {
 	conn := redis.NewClusterClient(&redis.ClusterOptions{Addrs: []string{host}})
 	if conn == nil {
 		log.Fatal("faild to connect %s\n", host)
@@ -290,7 +288,7 @@ func (r *redisCluster) FreshClusterInfo() (err error) {
 				log.Fatal(fmt.Sprintf("unknown Status %s", info[7]))
 			}
 			if len(info) == 8 { //the node info don't have any slot
-				r.runNodes[info[1]] = &nodes.RedisNodes{Id: info[0], IP: info[1], Type: nodeType, Master: info[3], Status: nodeStatus}
+				r.runNodes[info[1]] = &RedisNodes{Id: info[0], IP: info[1], Type: nodeType, Master: info[3], Status: nodeStatus}
 			} else { // the node has slot
 				slotList := make([][]int, 0)
 				for _, slot := range info[8:] {
@@ -315,12 +313,12 @@ func (r *redisCluster) FreshClusterInfo() (err error) {
 						slotList = append(slotList, []int{slotNum})
 					}
 				}
-				r.runNodes[info[1]] = &nodes.RedisNodes{Id: info[0], IP: info[1], Type: nodeType, Master: info[3], Status: nodeStatus, Slot: slotList}
+				r.runNodes[info[1]] = &RedisNodes{Id: info[0], IP: info[1], Type: nodeType, Master: info[3], Status: nodeStatus, Slot: slotList}
 			}
 
 		}
 
-		getNodeById := func(Id string) (rv *nodes.RedisNodes) {
+		getNodeById := func(Id string) (rv *RedisNodes) {
 			for _, node := range r.runNodes {
 				if node.Id == Id {
 					rv = node
@@ -341,14 +339,14 @@ func (r *redisCluster) FreshClusterInfo() (err error) {
 }
 
 // change the host replicate from the master
-func (r *redisCluster) replicate(host string, master *nodes.RedisNodes) (err error) {
+func (r *redisCluster) replicate(host string, master *RedisNodes) (err error) {
 	conn := r.configNodes[host].Connect()
 	_, err = conn.ClusterReplicate(master.Id).Result()
 	return
 }
 
 func (r *redisCluster) Replicate(host string, master string) {
-	if !common.IsValidIP(host) || !common.IsValidIP(master) {
+	if !IsValidIP(host) || !IsValidIP(master) {
 		log.Fatal("invalId host format!")
 	}
 	node, has := r.runNodes[master]
@@ -364,7 +362,7 @@ func (r *redisCluster) Replicate(host string, master string) {
 // add a master node
 // host string: ip:port => 127.0.0.1:8000
 func (r *redisCluster) AddHost(host string, nodeType int) (err error) {
-	if !common.IsValidIP(host) || nodeType == -1 {
+	if !IsValidIP(host) || nodeType == -1 {
 		log.Fatal("invalId host format or node type!")
 	}
 	hostInfo := strings.Split(host, ":")
@@ -388,7 +386,7 @@ func (r *redisCluster) AddHost(host string, nodeType int) (err error) {
 	if nodeType == Slave { // if it was a slave node
 		node, has := r.configNodes[host]
 		if has { //if this node has configuration on the configuration file
-			if !common.IsValidIP(node.Master) { // check the master ip is valId, split with ":" such as "127.0.0.1:8000"
+			if !IsValidIP(node.Master) { // check the master ip is valId, split with ":" such as "127.0.0.1:8000"
 				err = errors.New(fmt.Sprintf("invalId Master config of slave %s", host))
 				log.Fatal(err.Error())
 				return
@@ -431,7 +429,7 @@ func (r *redisCluster) forget(host string, Id string) (err error) {
 }
 
 // do forget on the all the node, queal delete the node from the cluster
-func (r *redisCluster) ForgetAll(forgetHost *nodes.RedisNodes) (err error) {
+func (r *redisCluster) ForgetAll(forgetHost *RedisNodes) (err error) {
 	for host := range r.runNodes {
 		if forgetHost.IP == host { // node can not forget itself
 			continue
@@ -493,7 +491,7 @@ func (r *redisCluster) SetAllNodeSlot() (err error) {
 	return
 }
 
-func (r *redisCluster) SetNode(nodeInfo *nodes.RedisNodes) (err error) {
+func (r *redisCluster) SetNode(nodeInfo *RedisNodes) (err error) {
 	_, has := r.runNodes[nodeInfo.IP] //check node exists or not
 	if !has {
 		log.Printf("node %s not exists! Add it\n", nodeInfo.IP)
@@ -509,7 +507,7 @@ func (r *redisCluster) SetNode(nodeInfo *nodes.RedisNodes) (err error) {
 	return
 }
 
-func (r *redisCluster) SetNodeSlot(nodeinfo *nodes.RedisNodes) {
+func (r *redisCluster) SetNodeSlot(nodeinfo *RedisNodes) {
 	if len(nodeinfo.Slot) == 0 {
 		return
 	}
@@ -532,7 +530,7 @@ func (r *redisCluster) SetNodeSlot(nodeinfo *nodes.RedisNodes) {
 	}
 }
 
-func (r *redisCluster) getNodeBySlot(slot int, max int) (find *nodes.RedisNodes, end int) {
+func (r *redisCluster) getNodeBySlot(slot int, max int) (find *RedisNodes, end int) {
 	for _, node := range r.runNodes { // if it's a slave node and has no slot skip it
 		if node.Type == Slave || len(node.Slot) == 0 {
 			continue
@@ -567,7 +565,7 @@ func getSlotInfo(slot []int) (from, to int) {
 	return
 }
 
-func (r *redisCluster) SetNodeType(nodeInfo *nodes.RedisNodes) (err error) {
+func (r *redisCluster) SetNodeType(nodeInfo *RedisNodes) (err error) {
 	runInfo := r.runNodes[nodeInfo.IP]
 	if runInfo.Type == nodeInfo.Type { // if config node type equal runenv node type
 		log.Printf("node %s is in the correct state config.type=%s  run.type=%s\n", nodeInfo.IP, HostType[nodeInfo.Type], HostType[runInfo.Type])
@@ -640,7 +638,7 @@ func (r *redisCluster) CountKeys(host string, slot int) (num int64, err error) {
 	return
 }
 
-func (r *redisCluster) MoveSlot(fromHost, toHost *nodes.RedisNodes, slot int) (err error) {
+func (r *redisCluster) MoveSlot(fromHost, toHost *RedisNodes, slot int) (err error) {
 	if fromHost.IP == toHost.IP { //slot in the correct node
 		return
 	}
@@ -658,7 +656,7 @@ func (r *redisCluster) MoveSlot(fromHost, toHost *nodes.RedisNodes, slot int) (e
 	return
 }
 
-func (r *redisCluster) SetAllSlot(slot int, toHost *nodes.RedisNodes) {
+func (r *redisCluster) SetAllSlot(slot int, toHost *RedisNodes) {
 	for _, node := range r.runNodes {
 		if node.Type == Master {
 			r.SetSlot(node.IP, slot, "node", toHost.Id)
@@ -725,7 +723,7 @@ func (s StringSlice) Less(i, j int) (rv bool) {
 
 // Take a snap shot
 func (r *redisCluster) TakeSnapShot(filename string) (err error) {
-	nodeList := make([]nodes.RedisNodes, 0)
+	nodeList := make([]RedisNodes, 0)
 	for _, node := range r.runNodes {
 		nodeList = append(nodeList, *node)
 	}

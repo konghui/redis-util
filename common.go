@@ -1,4 +1,4 @@
-package common
+package main
 
 // check the IP is valid or not
 func IsValidIP(host string) (rv bool) {
