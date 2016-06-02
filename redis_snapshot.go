@@ -6,31 +6,49 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/konghui/redis_snapshot/args"
+	"github.com/konghui/redis_snapshot/common"
+	"github.com/konghui/redis_snapshot/nodes"
 	"gopkg.in/redis.v3"
 )
 
-type redisNodes struct {
-	IP     string
-	Type   string
-	Master string
-	Slot   []string
-	status string
-	id     string
-	client *redis.Client
+const (
+	MAX_RETRY      = 10
+	RETRY_INTERVAL = 5
+)
+const (
+	Master = iota
+	Slave
+	Handshake
+)
+
+const (
+	DisConnected = iota
+	Connected
+)
+
+var ConnStatus = [...]string{
+	"disconnected",
+	"connected",
+}
+
+var HostType = [...]string{
+	"master",
+	"slave",
+	"handshake",
 }
 
 type redisCluster struct {
-	Schema      []redisNodes
+	Schema      []nodes.RedisNodes
 	logger      *log.Logger
 	Logfile     string
-	configNodes map[string]*redisNodes
+	configNodes map[string]*nodes.RedisNodes
 	conn        *redis.ClusterClient
-	runNodes    map[string]*redisNodes
+	runNodes    map[string]*nodes.RedisNodes
 }
 
 func (r *redisCluster) ConfigParser(configfile string) (err error) {
@@ -45,47 +63,67 @@ func (r *redisCluster) ConfigParser(configfile string) (err error) {
 	return
 }
 
-func RedisFixer(configfile string) (r *redisCluster) {
-	var fixer redisCluster
-	fixer.configNodes = make(map[string]*redisNodes)
-	fixer.runNodes = make(map[string]*redisNodes)
-	if err := fixer.ConfigParser(configfile); err != nil {
+func RedisSnapShot(configfile string) (r *redisCluster) {
+	var snapShot redisCluster
+	snapShot.configNodes = make(map[string]*nodes.RedisNodes)
+	snapShot.runNodes = make(map[string]*nodes.RedisNodes)
+	if err := snapShot.ConfigParser(configfile); err != nil {
 		log.Fatal(err.Error())
 	}
 
-	fd, err := os.OpenFile(fixer.Logfile, os.O_RDWR|os.O_CREATE, 0666)
+	fd, err := os.OpenFile(snapShot.Logfile, os.O_RDWR|os.O_CREATE, 0666)
 	if err != nil {
 		log.Fatal(err.Error())
 		os.Exit(1)
 	}
-	fixer.logger = log.New(fd, "redis_fix", log.Ldate|log.Ltime|log.Lshortfile)
-	fixer.initNodes()
-	fixer.ConnectAll()
-	fixer.FreshClusterInfo()
-	return &fixer
+
+	snapShot.logger = log.New(fd, "redis_snapshot", log.Ldate|log.Ltime|log.Lshortfile)
+	snapShot.initNodes()
+	snapShot.ConnectAll()
+	snapShot.FreshClusterInfo()
+
+	return &snapShot
 }
 
 // copy configure to the nodes
-func (r *redisCluster) registerNodes(node *redisNodes) {
+func (r *redisCluster) registerNodes(node *nodes.RedisNodes) {
 	r.configNodes[node.IP] = node
 }
 
 func (r *redisCluster) initNodes() {
 	for i := 0; i < len(r.Schema); i++ {
 		r.configNodes[r.Schema[i].IP] = &r.Schema[i]
+
 	}
 }
 
-func (r *redisCluster) printConfig() {
-	fmt.Printf("logfile=>%s\n", r.Logfile)
-	for _, v := range r.configNodes {
-		fmt.Printf("IP=>%s\tMaster=>%s\tType=%s\tSlot=%s\tid=%s\tstatus=%s\n", v.IP, v.Master, v.Type, v.Slot, v.id, v.status)
+func nodeStatus(nodes map[string]*nodes.RedisNodes) {
+	var slot string
+	slots := make([]string, 0)
+	for _, v := range nodes {
+		for _, num := range v.Slot {
+			if len(num) == 2 {
+				slot = fmt.Sprintf("[%d-%d]", num[0], num[1])
+			} else if len(num) == 1 {
+				slot = fmt.Sprintf("[%d]", num[0])
+			} else {
+				log.Fatal("invaliad slot %s", num)
+			}
+			slots = append(slots, slot)
+		}
+		log.Printf("IP=>%s\tMaster=>%s\tType=%s\tId=%s\tStatus=>%s\tSlot=>%s", v.IP, v.Master, HostType[v.Type], v.Id, ConnStatus[v.Status], strings.Join(slots, ","))
+		fmt.Println()
 	}
-	fmt.Printf("running node info:\n")
-	for _, v := range r.runNodes {
-		fmt.Printf("IP=>%s\tMaster=>%s\tType=%s\tSlot=%s\tid=%s\tstatus=%s\n", v.IP, v.Master, v.Type, v.Slot, v.id, v.status)
-	}
+}
 
+func (r *redisCluster) ShowConfig() {
+	log.Println("Config INFO:")
+	nodeStatus(r.configNodes)
+}
+
+func (r *redisCluster) ShowRun() {
+	log.Println("Running Info:")
+	nodeStatus(r.runNodes)
 }
 
 // connect to the all server in the list
@@ -93,7 +131,7 @@ func (r *redisCluster) ConnectAll() {
 	list := make([]string, len(r.configNodes))
 	i := 0
 	for _, v := range r.configNodes {
-		r.Connect(v.IP)
+		v.Connect()
 		list[i] = v.IP
 		i++
 	}
@@ -103,71 +141,164 @@ func (r *redisCluster) ConnectAll() {
 	}
 }
 
-// get the connect from the runNode
-func (r *redisCluster) Connect(host string) (conn *redis.Client) {
-	if node, has := r.runNodes[host]; has {
-		if node.client == nil { // has no redisClient is nil, try to connect
-			node.client = redis.NewClient(&redis.Options{Addr: node.IP})
+func getIndex(str string, list []string, compare func(string, string) bool) (rv int) {
+	for index, value := range list {
+		if compare(str, value) {
+			rv = index
+			return
 		}
-		conn = node.client
 	}
+	rv = -1
 	return
 }
 
+func callbackNodeInList(node *nodes.RedisNodes, args interface{}) bool {
+	if node.Type == Master {
+		return true
+	}
+	val, err := node.Client.ClusterNodes().Result()
+	if err != nil {
+		log.Fatal(err.Error())
+		return false
+	}
+	fmt.Println(val)
+	if strings.Contains(val, args.(string)) {
+		return true
+	}
+	return false
+}
+
+// run the callback function on the all node
+func (r *redisCluster) CheckAllNode(callback func(*nodes.RedisNodes, interface{}) bool, args interface{}) bool {
+	for _, redisNode := range r.configNodes {
+		if !callback(redisNode, args) {
+			return false
+		}
+	}
+	return true
+}
+
+// get the new cluster info
 func (r *redisCluster) FreshClusterInfo() (err error) {
 	val, err := r.conn.ClusterNodes().Result()
 	if err != nil {
 		log.Fatal(err.Error())
 		return
 	}
-	for _, nodeinfo := range strings.Split(val, "\n") {
-		info := strings.Split(nodeinfo, " ")
+	for _, nodeInfo := range strings.Split(val, "\n") {
+		info := strings.Split(nodeInfo, " ")
 		if len(info) < 8 { //invaliad cluster node info
 			continue
-		} else if len(info) == 8 { //the node info don't have any slot
-			r.runNodes[info[1]] = &redisNodes{id: info[0], IP: info[1], Type: info[2], Master: info[3], status: info[7]}
+		}
+		nodeType := getIndex(info[2], HostType[:2], strings.Contains)
+		if nodeType == -1 {
+			log.Fatal(fmt.Sprintf("unknown type %s", info[2]))
+		}
+		nodeStatus := getIndex(info[7], ConnStatus[:2], strings.Contains)
+		if nodeStatus == -1 {
+			log.Fatal(fmt.Sprintf("unknown Status %s", info[7]))
+		}
+		if len(info) == 8 { //the node info don't have any slot
+			r.runNodes[info[1]] = &nodes.RedisNodes{Id: info[0], IP: info[1], Type: nodeType, Master: info[3], Status: nodeStatus}
 		} else { // the node has slot
-			r.runNodes[info[1]] = &redisNodes{id: info[0], IP: info[1], Type: info[2], Master: info[3], status: info[7], Slot: info[8:]}
+			slotList := make([][]int, 0)
+			for _, slot := range info[8:] {
+				if strings.Contains(slot, "-") { //it has an range slot
+					var from, to int
+					slotInfo := strings.Split(slot, "-")
+					from, err = strconv.Atoi(slotInfo[0])
+					if err != nil {
+						return
+					}
+					to, err = strconv.Atoi(slotInfo[1])
+					if err != nil {
+						return
+					}
+					slotList = append(slotList, []int{from, to})
+				} else { // it has only one slot
+					var slotNum int
+					slotNum, err = strconv.Atoi(slot)
+					if err != nil {
+						return
+					}
+					slotList = append(slotList, []int{slotNum})
+				}
+			}
+			r.runNodes[info[1]] = &nodes.RedisNodes{Id: info[0], IP: info[1], Type: nodeType, Master: info[3], Status: nodeStatus, Slot: slotList}
 		}
 
+	}
+
+	getNodeById := func(Id string) (rv *nodes.RedisNodes) {
+		for _, node := range r.runNodes {
+			if node.Id == Id {
+				rv = node
+				return
+			}
+		}
+
+		rv = nil
+		return
+	}
+
+	for _, node := range r.runNodes {
+		if node.Type == Slave {
+			node.Master = getNodeById(node.Master).IP
+		}
 	}
 	return
 }
 
-func (r *redisCluster) Replicate(host string, master string) (err error) {
-	if !strings.Contains(host, ":") || !strings.Contains(master, ":") {
-		err = errors.New("invalid host format!")
-		os.Exit(1)
+// change the host replicate from the master
+func (r *redisCluster) replicate(host string, master *nodes.RedisNodes) (err error) {
+	conn := r.configNodes[host].Connect()
+	_, err = conn.ClusterReplicate(master.Id).Result()
+	return
+}
+
+func (r *redisCluster) Replicate(host string, master string) {
+	if !common.IsValidIP(host) || !common.IsValidIP(master) {
+		log.Fatal("invalId host format!")
 	}
-	conn := r.Connect(host)
 	node, has := r.runNodes[master]
 	if has {
-		conn.ClusterReplicate(node.id)
+		if err := r.replicate(host, node); err != nil {
+			log.Fatal(err.Error())
+		}
 	} else {
-		err = errors.New(fmt.Sprintf("can't found the client %s on the node list", node))
+		log.Fatal(fmt.Sprintf("can't found the Client %s on the node list", node))
 	}
-	return
 }
 
 // add a master node
 // host string: ip:port => 127.0.0.1:8000
-func (r *redisCluster) AddHost(host string, nodetype string) (err error) {
-	if !strings.Contains(host, ":") {
-		err = errors.New("invalid host format!")
-		os.Exit(1)
+func (r *redisCluster) AddHost(host string, nodeType int) (err error) {
+	if !common.IsValidIP(host) || nodeType == -1 {
+		log.Fatal("invalId host format or node type!")
 	}
 	hostInfo := strings.Split(host, ":")
-	val, err := r.conn.ClusterMeet(hostInfo[0], hostInfo[1]).Result()
+	_, err = r.conn.ClusterMeet(hostInfo[0], hostInfo[1]).Result()
 	if err != nil {
 		log.Fatal(err.Error())
 		return
 	}
+	for i := 0; ; i++ {
+		time.Sleep(RETRY_INTERVAL * time.Second)
+		if r.CheckAllNode(callbackNodeInList, host) {
+			log.Printf("add node %s sucess!\n", host)
+			break
+		}
+		if i >= MAX_RETRY {
+			log.Fatal(fmt.Sprintf("add node %s faild", host))
+		}
+	}
+
 	r.FreshClusterInfo()
-	if nodetype == "slave" { // if it was a slave node
+	if nodeType == Slave { // if it was a slave node
 		node, has := r.configNodes[host]
 		if has { //if this node has configuration on the configuration file
-			if !strings.Contains(node.Master, ":") { // check the master ip is valiad, split with ":" such as "127.0.0.1:8000"
-				err = errors.New(fmt.Sprintf("invalid Master config of slave %s", host))
+			if !common.IsValidIP(node.Master) { // check the master ip is valId, split with ":" such as "127.0.0.1:8000"
+				err = errors.New(fmt.Sprintf("invalId Master config of slave %s", host))
 				log.Fatal(err.Error())
 				return
 			}
@@ -181,7 +312,7 @@ func (r *redisCluster) AddHost(host string, nodetype string) (err error) {
 						return
 					}
 				}
-				if r.runNodes[node.Master].Type == "slave" { //if the master node was configure as the slave node or not
+				if r.runNodes[node.Master].Type == Slave { //if the master node was configure as the slave node or not
 					err = errors.New(fmt.Sprintf("Node %s is a slave node, can't change it to the master state", node.Master))
 					log.Fatal(err.Error())
 					return
@@ -191,43 +322,33 @@ func (r *redisCluster) AddHost(host string, nodetype string) (err error) {
 				os.Exit(1)
 			}
 		}
-		if err = r.Replicate(node.IP, node.Master); err != nil { //change the node to the slave status
+		master := r.runNodes[node.Master]
+		if err = r.replicate(node.IP, master); err != nil { //change the node to the slave Status
 			log.Fatal(err.Error())
 			return
 		}
 		r.FreshClusterInfo() //refreash the local node list
 
 	}
-	fmt.Printf("val=%s\n", val)
 	return
 }
 
-// delete the node from cluster
-func (r *redisCluster) Forget(host string, forgetHost string) (err error) {
-	if !strings.Contains(host, ":") || !strings.Contains(forgetHost, ":") {
-		err = errors.New("invalid host format!")
-		return
-	}
-	node, has := r.runNodes[forgetHost]
-	if !has {
-		err = errors.New("id should not be empty!")
-		log.Fatal(err.Error())
-		return
-	}
-	conn := r.Connect(host)
-	val, err := conn.ClusterForget(node.id).Result()
-	if err != nil {
-		log.Fatal(err.Error())
-		return
-	}
-	fmt.Printf("val=%s\n", val)
+func (r *redisCluster) forget(host string, Id string) (err error) {
+	conn := r.configNodes[host].Connect()
+	_, err = conn.ClusterForget(Id).Result()
 	return
 }
 
 // do forget on the all the node, queal delete the node from the cluster
-func (r *redisCluster) ForgetAll(forgetHost string) (err error) {
+func (r *redisCluster) ForgetAll(forgetHost *nodes.RedisNodes) (err error) {
 	for host := range r.runNodes {
-		r.Forget(host, forgetHost)
+		if forgetHost.IP == host { // node can not forget itself
+			continue
+		}
+		if err = r.forget(host, forgetHost.Id); err != nil {
+			return
+		}
+
 	}
 	r.FreshClusterInfo()
 	return
@@ -235,7 +356,7 @@ func (r *redisCluster) ForgetAll(forgetHost string) (err error) {
 
 // do failover on the salve node, so it can replace the its master node
 func (r *redisCluster) FailOver(slavehost string) (err error) {
-	conn := r.Connect(slavehost)
+	conn := r.configNodes[slavehost].Connect()
 	_, err = conn.ClusterFailover().Result()
 	if err != nil {
 		log.Fatal(err.Error())
@@ -245,24 +366,27 @@ func (r *redisCluster) FailOver(slavehost string) (err error) {
 }
 
 // fix the cluster
-func (r *redisCluster) Fix() (err error) {
-	fmt.Println("Try to check and fix the cloud........")
+func (r *redisCluster) Restore() (err error) {
+	log.Println("Delete the disconnect node from cluster.....")
+	r.RemoveDisconnectNode()
+	log.Println("Try to check and fix the cloud........")
 	r.SetAllNodeType()
+	log.Println("check the slot in the node....")
 	r.SetAllNodeSlot()
 	return
 }
 
 func (r *redisCluster) RemoveDisconnectNode() {
 	for _, node := range r.runNodes {
-		if node.status == "disconnect" {
-			r.ForgetAll(node.IP)
+		if node.Status == DisConnected {
+			r.ForgetAll(node)
 		}
 	}
 }
 
 func (r *redisCluster) SetAllNodeType() (err error) {
 	for _, node := range r.configNodes {
-		if err = r.SetNodeType(node); err != nil {
+		if err = r.SetNode(node); err != nil {
 			log.Fatal(err.Error())
 		}
 	}
@@ -278,22 +402,23 @@ func (r *redisCluster) SetAllNodeSlot() (err error) {
 	return
 }
 
-func (r *redisCluster) SetNode(nodeinfo *redisNodes) (err error) {
-	node, has := r.runNodes[nodeinfo.IP]
+func (r *redisCluster) SetNode(nodeInfo *nodes.RedisNodes) (err error) {
+	_, has := r.runNodes[nodeInfo.IP] //check node exists or not
 	if !has {
-		fmt.Printf("node %s not exists! Add it\n", node.IP)
-		if err = r.AddHost(node.IP, node.Type); err != nil {
+		log.Printf("node %s not exists! Add it\n", nodeInfo.IP)
+		if err = r.AddHost(nodeInfo.IP, nodeInfo.Type); err != nil {
 			return
 		}
+
 	}
-	if err = r.SetNodeType(nodeinfo); err != nil {
+	if err = r.SetNodeType(nodeInfo); err != nil {
 		return
 	}
-	r.SetNodeSlot(nodeinfo)
+	r.SetNodeSlot(nodeInfo)
 	return
 }
 
-func (r *redisCluster) SetNodeSlot(nodeinfo *redisNodes) {
+func (r *redisCluster) SetNodeSlot(nodeinfo *nodes.RedisNodes) {
 	if len(nodeinfo.Slot) == 0 {
 		return
 	}
@@ -301,26 +426,24 @@ func (r *redisCluster) SetNodeSlot(nodeinfo *redisNodes) {
 	for _, slotDst := range nodeinfo.Slot {
 		fromDst, toDst := getSlotInfo(slotDst)
 		for i := fromDst; i <= toDst; {
-			fmt.Printf("toDst = %d\n", toDst)
 			nodeSrc, end := r.getNodeBySlot(i, toDst)
 			if nodeSrc == nil {
 				r.AddSlot(i)
 				i++
 				continue
 			}
+			r.FreshClusterInfo()
 			for j := i; j <= end; j++ {
-				//fmt.Printf("move slot from %s to %s slot %d\n", nodeinfo.IP, nodeSrc.IP, j)
 				r.MoveSlot(nodeSrc, runinfo, j)
 			}
 			i = end + 1
 		}
 	}
-	r.FreshClusterInfo()
 }
 
-func (r *redisCluster) getNodeBySlot(slot int, max int) (find *redisNodes, end int) {
+func (r *redisCluster) getNodeBySlot(slot int, max int) (find *nodes.RedisNodes, end int) {
 	for _, node := range r.runNodes { // if it's a slave node and has no slot skip it
-		if node.Type == "slave" || len(node.Slot) == 0 {
+		if node.Type == Slave || len(node.Slot) == 0 {
 			continue
 		}
 		for _, slotInfo := range node.Slot {
@@ -339,40 +462,48 @@ func (r *redisCluster) getNodeBySlot(slot int, max int) (find *redisNodes, end i
 	return
 }
 
-func getSlotInfo(slot string) (from, to int) {
-	if strings.Contains(slot, "-") { // if the slot is like 1-2
-		slotInfo := strings.Split(slot, "-")
-		from, _ = strconv.Atoi(slotInfo[0])
-		to, _ = strconv.Atoi(slotInfo[1])
-	} else { // only one slot like 1024
-		from, _ = strconv.Atoi(slot)
-		to, _ = strconv.Atoi(slot)
+func getSlotInfo(slot []int) (from, to int) {
+	length := len(slot)
+	if length == 2 { // if the slot is like 1-2
+		from = slot[0]
+		to = slot[1]
+	} else if length == 1 { // only one slot like 1024
+		from = slot[0]
+		to = slot[0]
+	} else {
+		log.Fatal("unknown slot %s", slot)
 	}
 	return
 }
 
-func (r *redisCluster) SetNodeType(nodeinfo *redisNodes) (err error) {
-	if strings.Contains(r.runNodes[nodeinfo.IP].Type, nodeinfo.Type) {
-		fmt.Printf("node %s is in the correct state config.type=%s  run.type=%s\n", nodeinfo.IP, r.runNodes[nodeinfo.IP].Type, nodeinfo.Type)
+func (r *redisCluster) SetNodeType(nodeInfo *nodes.RedisNodes) (err error) {
+	runInfo := r.runNodes[nodeInfo.IP]
+	if runInfo.Type == nodeInfo.Type { // if config node type equal runenv node type
+		log.Printf("node %s is in the correct state config.type=%s  run.type=%s\n", nodeInfo.IP, HostType[nodeInfo.Type], HostType[runInfo.Type])
 		return
 	}
-	fmt.Printf("node %s is in an incorrect state, try to fix it\n", nodeinfo.IP)
-	if nodeinfo.Type == "master" {
-		if err = r.FailOver(nodeinfo.IP); err != nil {
+	log.Printf("node %s is in an incorrect state, try to fix it\n", nodeInfo.IP)
+	if nodeInfo.Type == Master {
+		if err = r.FailOver(nodeInfo.IP); err != nil {
 			return
 		}
-	} else if nodeinfo.Type == "slave" {
-		if err = r.Replicate(nodeinfo.IP, nodeinfo.Master); err != nil {
-			return
+	} else if nodeInfo.Type == Slave {
+		master, has := r.runNodes[nodeInfo.Master]
+		if !has {
+			log.Fatal(fmt.Sprintf("can't find node %s Master node %s.", nodeInfo.IP, nodeInfo.Master))
+		} // if master is slave fix
+		if master.Type == Slave {
+			if err = r.FailOver(master.IP); err != nil {
+				return
+			}
+		} else {
+			if err = r.replicate(nodeInfo.IP, master); err != nil {
+				return
+			}
 		}
 	} else {
-		err = errors.New(fmt.Sprintf("unknown type %s", nodeinfo.Type))
+		err = errors.New(fmt.Sprintf("unknown type %s", HostType[nodeInfo.Type]))
 	}
-	// compare slot here
-	return
-}
-
-func getMasterNodes(nodes map[string]*redisNodes) (master []string) {
 	return
 }
 
@@ -384,70 +515,62 @@ func (r *redisCluster) AddSlot(slot int) (err error) {
 }
 
 func (r *redisCluster) SetSlot(host string, slot int, cmd, nodeId string) (err error) {
-	fmt.Printf("IP=>%s, slot=>%d, cmd=%s, id=%s\n", host, slot, cmd, nodeId)
-	conn := r.Connect(host)
-	val, err := conn.ClusterSetSlot(slot, cmd, nodeId).Result()
+	log.Printf("IP=>%s, slot=>%d, cmd=%s, Id=%s\n", host, slot, cmd, nodeId)
+	if r.runNodes[host].Type == Slave {
+		return
+	}
+	conn := r.configNodes[host].Connect()
+	_, err = conn.ClusterSetSlot(slot, cmd, nodeId).Result()
 	if err != nil {
 		log.Fatal(err.Error())
 		return
 	}
-	fmt.Println(val)
 	return
 }
 
+// Delete an slot from node
 func (r *redisCluster) DelSlot(host string, min, max int) (err error) {
-	conn := r.Connect(host)
-	val, err := conn.ClusterDelSlotsRange(min, max).Result()
+	conn := r.configNodes[host].Connect()
+	_, err = conn.ClusterDelSlotsRange(min, max).Result()
 	if err != nil {
 		log.Fatal(err.Error())
 		return
 	}
-	fmt.Println(val)
 	return
 }
 
+// count how many key in the slot
 func (r *redisCluster) CountKeys(host string, slot int) (num int64, err error) {
-	conn := r.Connect(host)
+	conn := r.configNodes[host].Connect()
 	if num, err = conn.ClusterCountKeysInSlot(slot).Result(); err != nil {
-		fmt.Println(err.Error())
+		log.Fatal(err.Error())
 		return
 	}
 	return
 }
 
-func (r *redisCluster) MoveSlot(fromHost, toHost *redisNodes, slot int) (err error) {
-	if fromHost.IP == toHost.IP {
-		//fmt.Printf("skip slot %d\n", slot)
+func (r *redisCluster) MoveSlot(fromHost, toHost *nodes.RedisNodes, slot int) (err error) {
+	if fromHost.IP == toHost.IP { //slot in the correct node
 		return
 	}
 	log.Printf("move slot %d from %s to %s\n", slot, fromHost.IP, toHost.IP)
-	r.FreshClusterInfo()
-	//	return
-	r.printConfig()
-	r.SetSlot(fromHost.IP, slot, "migrating", toHost.id)
-	r.SetSlot(toHost.IP, slot, "importing", fromHost.id)
-	keyNum, err := r.CountKeys(fromHost.IP, slot) // get the total number
+	r.SetSlot(fromHost.IP, slot, "migrating", toHost.Id) // set  src node to the migrating state
+	r.SetSlot(toHost.IP, slot, "importing", fromHost.Id) // set dst node to the importing state
+	keyNum, err := r.CountKeys(fromHost.IP, slot)        // get the total number
 	for _, key := range r.GetKeysInSlot(fromHost.IP, slot, int(keyNum)) {
 		r.Migrate(fromHost.IP, toHost.IP, key, 0, 5000)
 	}
-	//r.SetSlot(fromHost.IP, slot, "stable", "")
-	//r.SetSlot(toHost.IP, slot, "stable", "")
-	//val, err := r.conn.ClusterSetSlot(slot, "node", toHost.id).Result()
-	//if err != nil {
-	//	log.Fatal(err.Error())
-	//}
-	//fmt.Println(val)
-	r.SetSlot(fromHost.IP, slot, "node", toHost.id)
-	r.SetSlot(toHost.IP, slot, "node", toHost.id)
+
+	r.SetSlot(fromHost.IP, slot, "node", toHost.Id)
+	r.SetSlot(toHost.IP, slot, "node", toHost.Id)
 	r.SetAllSlot(slot, toHost)
 	return
 }
 
-func (r *redisCluster) SetAllSlot(slot int, toHost *redisNodes) {
+func (r *redisCluster) SetAllSlot(slot int, toHost *nodes.RedisNodes) {
 	for _, node := range r.runNodes {
-		if strings.Contains(node.Type, "master") {
-
-			r.SetSlot(node.IP, slot, "node", toHost.id)
+		if node.Type == Master {
+			r.SetSlot(node.IP, slot, "node", toHost.Id)
 		}
 	}
 }
@@ -459,7 +582,7 @@ func (r *redisCluster) DelAllSlot(min, max int) {
 }
 
 func (r *redisCluster) Migrate(from, to, key string, db int64, timeout time.Duration) (err error) {
-	conn := r.Connect(from)
+	conn := r.configNodes[from].Connect()
 	toHost := strings.Split(to, ":")
 	if _, err = conn.Migrate(toHost[0], toHost[1], key, db, timeout).Result(); err != nil {
 		log.Fatal(err.Error())
@@ -469,7 +592,7 @@ func (r *redisCluster) Migrate(from, to, key string, db int64, timeout time.Dura
 }
 
 func (r *redisCluster) GetKeysInSlot(host string, slot, num int) (keyList []string) {
-	conn := r.Connect(host)
+	conn := r.configNodes[host].Connect()
 	keyList, err := conn.ClusterGetKeysInSlot(slot, num).Result()
 	if err != nil {
 		log.Fatal(err.Error())
@@ -509,6 +632,31 @@ func (s StringSlice) Less(i, j int) (rv bool) {
 	return
 }
 
+// Take a snap shot
+func (r *redisCluster) TakeSnapShot(filename string) (err error) {
+	nodeList := make([]nodes.RedisNodes, 0)
+	for _, node := range r.runNodes {
+		nodeList = append(nodeList, *node)
+	}
+
+	content, err := json.MarshalIndent(redisCluster{Schema: nodeList, Logfile: r.Logfile}, "", "\t")
+	if err != nil {
+		log.Fatal(err.Error())
+	}
+	if filename != "" {
+		fd, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE, 0666)
+		if err != nil {
+			log.Fatal(err.Error())
+		}
+		defer fd.Close()
+		fd.Write(content)
+	} else {
+		fmt.Println(string(content))
+	}
+	return
+}
+
+/*
 func (r *redisCluster) sortSlot() {
 	slots := make(StringSlice, 0, 10)
 	for _, node := range r.configNodes {
@@ -522,7 +670,7 @@ func (r *redisCluster) sortSlot() {
 	fmt.Println(slots)
 }
 
-/*
+
 func MergeSlot(slots []string) {
 	for i := 0; i < len(slots); i++ {
 		if strings.Contains(slots[i], "-") {
@@ -534,7 +682,7 @@ func MergeSlot(slots []string) {
 /*func (r *redisCluster) hasSlot(slot int) {
 	find := false
 	for _, node := range r.configNodes {
-		if node.Master == "slave" || len(node.Slot) == 0 {
+		if node.Master == "Slave" || len(node.Slot) == 0 {
 			continue
 		}
 		for _, slots := range node.Slot {
@@ -552,35 +700,26 @@ func (r *redisCluster) CheckSlot() (slot []string) {
 }
 */
 func main() {
-	cluster := RedisFixer("config.json")
-	//cluster.printConfig()
-	//	if err := fixer.AddMaster("127.0.0.1:7008"); err != nil {
-	//		fmt.Println(err.Error())
-	//	}
-	//if err := fixer.Forget("127.0.0.1:7008"); err != nil {
-	//	fmt.Println(err.Error())
-	//}
-	//fixer.ForgetAll("127.0.0.1:7008")
-	//if err := fixer.FailOver("127.0.0.1:7000"); err != nil {
-	//	fmt.Println(err.Error())
-	//}
-	//	fixer.FreshClusterInfo()
-	//	fixer.printConfig()
-	cluster.Fix()
-	//if err := cluster.SetSlot("127.0.0.1:7000", 11, "node", "aa81cfa967c26b7a2cf8f2388044a38d4cc448f5"); err != nil {
-	//	fmt.Println(err.Error())
-	//}
-	//if err := cluster.Migrate("127.0.0.1:7000", "127.0.0.1:7006", "foo847", 0, 2000000); err != nil {
-	//	fmt.Println(err.Error())
-	//}
-	//cluster.GetKeysInSlot("127.0.0.1:7000", 3, 10)
-	//if num, err := cluster.CountKeys("127.0.0.1:7000", 3); err != nil {
-	//	fmt.Println(err.Error())
-	//} else {
-	//	fmt.Printf("num=%d\n", num)
-	//}
-	//from := cluster.runNodes["127.0.0.1:7007"]
-	//to := cluster.runNodes["127.0.0.1:7001"]
+	args.InitArgs()
+	cluster := RedisSnapShot("")
+
+	/*	if *restore {
+			cluster.Restore()
+		}
+		if *export {
+			cluster.TakeSnapShot("")
+		}
+		if *showrun {
+			cluster.ShowRun()
+		}
+		if *showconfig {
+			cluster.ShowConfig()
+		}
+		if *failover != "" {
+			cluster.FailOver(*failover)
+		}
+		if *delete != "" {
+			cluster.ForgetAll(cluster.runNodes[*delete])
+		}*/
 	//cluster.MoveSlot(to, from, 10923)
-	//cluster.sortSlot()
 }
