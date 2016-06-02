@@ -63,24 +63,33 @@ func (r *redisCluster) ConfigParser(configfile string) (err error) {
 	return
 }
 
-func RedisSnapShot(configfile string) (r *redisCluster) {
-	var snapShot redisCluster
-	snapShot.configNodes = make(map[string]*nodes.RedisNodes)
-	snapShot.runNodes = make(map[string]*nodes.RedisNodes)
-	if err := snapShot.ConfigParser(configfile); err != nil {
+func (r *redisCluster) ParseFromFile(configfile string) {
+	if err := r.ConfigParser(configfile); err != nil {
 		log.Fatal(err.Error())
 	}
 
-	fd, err := os.OpenFile(snapShot.Logfile, os.O_RDWR|os.O_CREATE, 0666)
+	fd, err := os.OpenFile(r.Logfile, os.O_RDWR|os.O_CREATE, 0666)
 	if err != nil {
 		log.Fatal(err.Error())
 		os.Exit(1)
 	}
+	r.logger = log.New(fd, "redis_snapshot", log.Ldate|log.Ltime|log.Lshortfile)
+}
 
-	snapShot.logger = log.New(fd, "redis_snapshot", log.Ldate|log.Ltime|log.Lshortfile)
+func (r *redisCluster) ParserFromHost(host string) {
+	FreshThroughHost(host, r.configNodes)
+}
+
+func RedisSnapShot(args map[string]string) (r *redisCluster) {
+	var snapShot redisCluster
+	snapShot.configNodes = make(map[string]*nodes.RedisNodes)
+	snapShot.runNodes = make(map[string]*nodes.RedisNodes)
+	if val, has := args["file"]; has {
+		snapShot.ParseFromFile(val)
+	} else if val, has := args["host"]; has {
+		snapShot.ParserFromHost(val)
+	}
 	snapShot.initNodes()
-	snapShot.ConnectAll()
-	snapShot.FreshClusterInfo()
 
 	return &snapShot
 }
@@ -95,6 +104,8 @@ func (r *redisCluster) initNodes() {
 		r.configNodes[r.Schema[i].IP] = &r.Schema[i]
 
 	}
+	r.ConnectAll()
+	r.FreshClusterInfo()
 }
 
 func nodeStatus(nodes map[string]*nodes.RedisNodes) {
@@ -135,6 +146,7 @@ func (r *redisCluster) ConnectAll() {
 		list[i] = v.IP
 		i++
 	}
+	fmt.Println(list)
 	r.conn = redis.NewClusterClient(&redis.ClusterOptions{Addrs: list})
 	if r.conn == nil {
 		log.Fatal("faild to connect %s\n", list)
@@ -178,9 +190,8 @@ func (r *redisCluster) CheckAllNode(callback func(*nodes.RedisNodes, interface{}
 	return true
 }
 
-// get the new cluster info
-func (r *redisCluster) FreshClusterInfo() (err error) {
-	val, err := r.conn.ClusterNodes().Result()
+func Fresh(client *redis.ClusterClient, nodeList map[string]*nodes.RedisNodes) (err error) {
+	val, err := client.ClusterNodes().Result()
 	if err != nil {
 		log.Fatal(err.Error())
 		return
@@ -199,7 +210,7 @@ func (r *redisCluster) FreshClusterInfo() (err error) {
 			log.Fatal(fmt.Sprintf("unknown Status %s", info[7]))
 		}
 		if len(info) == 8 { //the node info don't have any slot
-			r.runNodes[info[1]] = &nodes.RedisNodes{Id: info[0], IP: info[1], Type: nodeType, Master: info[3], Status: nodeStatus}
+			nodeList[info[1]] = &nodes.RedisNodes{Id: info[0], IP: info[1], Type: nodeType, Master: info[3], Status: nodeStatus}
 		} else { // the node has slot
 			slotList := make([][]int, 0)
 			for _, slot := range info[8:] {
@@ -224,13 +235,13 @@ func (r *redisCluster) FreshClusterInfo() (err error) {
 					slotList = append(slotList, []int{slotNum})
 				}
 			}
-			r.runNodes[info[1]] = &nodes.RedisNodes{Id: info[0], IP: info[1], Type: nodeType, Master: info[3], Status: nodeStatus, Slot: slotList}
+			nodeList[info[1]] = &nodes.RedisNodes{Id: info[0], IP: info[1], Type: nodeType, Master: info[3], Status: nodeStatus, Slot: slotList}
 		}
 
 	}
 
 	getNodeById := func(Id string) (rv *nodes.RedisNodes) {
-		for _, node := range r.runNodes {
+		for _, node := range nodeList {
 			if node.Id == Id {
 				rv = node
 				return
@@ -241,11 +252,92 @@ func (r *redisCluster) FreshClusterInfo() (err error) {
 		return
 	}
 
-	for _, node := range r.runNodes {
+	for _, node := range nodeList {
 		if node.Type == Slave {
 			node.Master = getNodeById(node.Master).IP
 		}
 	}
+	return
+
+}
+
+func FreshThroughHost(host string, node map[string]*nodes.RedisNodes) {
+	conn := redis.NewClusterClient(&redis.ClusterOptions{Addrs: []string{host}})
+	if conn == nil {
+		log.Fatal("faild to connect %s\n", host)
+	}
+	Fresh(conn, node)
+}
+
+// get the new cluster info
+func (r *redisCluster) FreshClusterInfo() (err error) {
+	err = Fresh(r.conn, r.runNodes)
+	/*	val, err := r.conn.ClusterNodes().Result()
+		if err != nil {
+			log.Fatal(err.Error())
+			return
+		}
+		for _, nodeInfo := range strings.Split(val, "\n") {
+			info := strings.Split(nodeInfo, " ")
+			if len(info) < 8 { //invaliad cluster node info
+				continue
+			}
+			nodeType := getIndex(info[2], HostType[:2], strings.Contains)
+			if nodeType == -1 {
+				log.Fatal(fmt.Sprintf("unknown type %s", info[2]))
+			}
+			nodeStatus := getIndex(info[7], ConnStatus[:2], strings.Contains)
+			if nodeStatus == -1 {
+				log.Fatal(fmt.Sprintf("unknown Status %s", info[7]))
+			}
+			if len(info) == 8 { //the node info don't have any slot
+				r.runNodes[info[1]] = &nodes.RedisNodes{Id: info[0], IP: info[1], Type: nodeType, Master: info[3], Status: nodeStatus}
+			} else { // the node has slot
+				slotList := make([][]int, 0)
+				for _, slot := range info[8:] {
+					if strings.Contains(slot, "-") { //it has an range slot
+						var from, to int
+						slotInfo := strings.Split(slot, "-")
+						from, err = strconv.Atoi(slotInfo[0])
+						if err != nil {
+							return
+						}
+						to, err = strconv.Atoi(slotInfo[1])
+						if err != nil {
+							return
+						}
+						slotList = append(slotList, []int{from, to})
+					} else { // it has only one slot
+						var slotNum int
+						slotNum, err = strconv.Atoi(slot)
+						if err != nil {
+							return
+						}
+						slotList = append(slotList, []int{slotNum})
+					}
+				}
+				r.runNodes[info[1]] = &nodes.RedisNodes{Id: info[0], IP: info[1], Type: nodeType, Master: info[3], Status: nodeStatus, Slot: slotList}
+			}
+
+		}
+
+		getNodeById := func(Id string) (rv *nodes.RedisNodes) {
+			for _, node := range r.runNodes {
+				if node.Id == Id {
+					rv = node
+					return
+				}
+			}
+
+			rv = nil
+			return
+		}
+
+		for _, node := range r.runNodes {
+			if node.Type == Slave {
+				node.Master = getNodeById(node.Master).IP
+			}
+		}*/
 	return
 }
 
@@ -701,8 +793,11 @@ func (r *redisCluster) CheckSlot() (slot []string) {
 */
 func main() {
 	args.InitArgs()
-	cluster := RedisSnapShot("")
-
+	myargs := make(map[string]string)
+	//myargs["file"] = "mysnap.json"
+	myargs["host"] = "127.0.0.1:7000"
+	cluster := RedisSnapShot(myargs)
+	cluster.TakeSnapShot("")
 	/*	if *restore {
 			cluster.Restore()
 		}
