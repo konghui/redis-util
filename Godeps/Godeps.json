@@ -1,0 +1,24 @@
+{
+	"ImportPath": "github.com/konghui/redis-snapshot",
+	"GoVersion": "go1.6",
+	"GodepVersion": "v72",
+	"Deps": [
+		{
+			"ImportPath": "github.com/mediocregopher/radix.v2/cluster",
+			"Rev": "ae04b3eb3731f94789205d1268e0759371166605"
+		},
+		{
+			"ImportPath": "github.com/mediocregopher/radix.v2/pool",
+			"Rev": "ae04b3eb3731f94789205d1268e0759371166605"
+		},
+		{
+			"ImportPath": "github.com/mediocregopher/radix.v2/redis",
+			"Rev": "ae04b3eb3731f94789205d1268e0759371166605"
+		},
+		{
+			"ImportPath": "github.com/urfave/cli",
+			"Comment": "v1.17.0-44-g9a18ffa",
+			"Rev": "9a18ffad6c548ca4d458d4c30a8aa4d181cf92fa"
+		}
+	]
+}
