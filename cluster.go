@@ -2,18 +2,16 @@ package main
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
 	"os"
 	"strconv"
 	"strings"
-	"time"
 )
 
 const (
 	MAX_RETRY      = 10
-	RETRY_INTERVAL = 5
+	RETRY_INTERVAL = 10
 )
 const (
 	Master = iota
@@ -78,17 +76,17 @@ func (r *redisCluster) ParseFromHost(host string) {
 	FreshThroughHost(host, r.configNodes)
 }
 
-func RedisSnapShot(args map[string]string) (r *redisCluster) {
-	var snapShot redisCluster
-	snapShot.configNodes = make(map[string]*RedisNodes)
-	snapShot.runNodes = make(map[string]*RedisNodes)
+func RedisTrib(args map[string]string) (r *redisCluster) {
+	var trib redisCluster
+	trib.configNodes = make(map[string]*RedisNodes)
+	trib.runNodes = make(map[string]*RedisNodes)
 	if val, has := args["file"]; has {
-		snapShot.ParseFromFile(val)
+		trib.ParseFromFile(val)
 	} else if val, has := args["host"]; has {
-		snapShot.ParseFromHost(val)
+		trib.ParseFromHost(val)
 	}
-	snapShot.initNodes()
-	return &snapShot
+	trib.initNodes()
+	return &trib
 }
 
 func (r *redisCluster) ShowConfig() {
@@ -208,8 +206,9 @@ func FreshThroughHost(host string, node map[string]*RedisNodes) {
 
 // get the new cluster info
 func (r *redisCluster) FreshClusterInfo() (err error) {
+	r.ShowConfig()
 	for _, node := range r.configNodes {
-		err = Fresh(node.Client, r.runNodes)
+		err = Fresh(node.Connect(), r.runNodes)
 		if err == nil {
 			return
 		}
@@ -240,90 +239,6 @@ func (r *redisCluster) Replicate(host string, master string) {
 	}
 }
 
-// add a master node
-// host string: ip:port => 127.0.0.1:8000
-func (r *redisCluster) AddHost(host string, nodeType int) (err error) {
-	if !IsValidIP(host) || nodeType == -1 {
-		log.Fatal("invalId host format or node type!")
-	}
-	hostInfo := strings.Split(host, ":")
-	err = r.conn.ClusterMeet(hostInfo[0], hostInfo[1])
-	if err != nil {
-		log.Fatal(err.Error())
-		return
-	}
-	for i := 0; ; i++ {
-		time.Sleep(RETRY_INTERVAL * time.Second)
-		if r.CheckAllNode(callbackNodeInList, host) {
-			log.Printf("add node %s sucess!\n", host)
-			break
-		}
-		if i >= MAX_RETRY {
-			log.Fatal(fmt.Sprintf("add node %s faild", host))
-		}
-	}
-
-	r.FreshClusterInfo()
-	if nodeType == Slave { // if it was a slave node
-		node, has := r.configNodes[host]
-		if has { //if this node has configuration on the configuration file
-			if !IsValidIP(node.Master) { // check the master ip is valId, split with ":" such as "127.0.0.1:8000"
-				err = errors.New(fmt.Sprintf("invalId Master config of slave %s", host))
-				log.Fatal(err.Error())
-				return
-			}
-
-			node, has = r.configNodes[node.Master]
-			if has { //if the slave's master has configuration on the configuration file
-				_, has = r.runNodes[node.Master] // check the master node exists on the online environment or not
-				if !has {                        // if not exists add it
-					if err = r.AddHost(node.IP, node.Type); err != nil {
-						log.Fatal(err.Error())
-						return
-					}
-				}
-				if r.runNodes[node.Master].Type == Slave { //if the master node was configure as the slave node or not
-					err = errors.New(fmt.Sprintf("Node %s is a slave node, can't change it to the master state", node.Master))
-					log.Fatal(err.Error())
-					return
-				}
-			} else { // if the master node not found on the json file
-				fmt.Printf("Master node %s not exist!\n", node.IP)
-				os.Exit(1)
-			}
-		}
-		master := r.runNodes[node.Master]
-		if err = r.replicate(node.IP, master); err != nil { //change the node to the slave Status
-			log.Fatal(err.Error())
-			return
-		}
-		r.FreshClusterInfo() //refreash the local node list
-
-	}
-	return
-}
-
-func (r *redisCluster) forget(host string, Id string) (err error) {
-	conn := r.configNodes[host].Connect()
-	err = conn.ClusterForget(Id)
-	return
-}
-
-// do forget on the all the node, queal delete the node from the cluster
-func (r *redisCluster) ForgetAll(forgetHost *RedisNodes) (err error) {
-	for host := range r.runNodes {
-		if forgetHost.IP == host { // node can not forget itself
-			continue
-		}
-		if err = r.forget(host, forgetHost.Id); err != nil {
-			return
-		}
-
-	}
-	r.FreshClusterInfo()
-	return
-}
-
 // do failover on the salve node, so it can replace the its master node
 func (r *redisCluster) FailOver(slavehost string) (err error) {
 	conn := r.configNodes[slavehost].Connect()
@@ -333,25 +248,6 @@ func (r *redisCluster) FailOver(slavehost string) (err error) {
 		return
 	}
 	return
-}
-
-// fix the cluster
-func (r *redisCluster) Restore() (err error) {
-	log.Println("Delete the disconnect node from cluster.....")
-	r.RemoveDisconnectNode()
-	log.Println("Try to check and fix the cloud........")
-	r.SetAllNodeType()
-	log.Println("check the slot in the node....")
-	r.SetAllNodeSlot()
-	return
-}
-
-func (r *redisCluster) RemoveDisconnectNode() {
-	for _, node := range r.runNodes {
-		if node.Status == DisConnected {
-			r.ForgetAll(node)
-		}
-	}
 }
 
 // Delete an slot from node

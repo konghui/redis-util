@@ -2,3 +2,4 @@ json
 *.log
 test.json
 redis-snapshot
+*.*~
