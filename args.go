@@ -21,8 +21,6 @@ func InitArgs() {
 	}
 
 	app.Action = func(c *cli.Context) error {
-		fmt.Println(c.String("host"))
-		fmt.Println(c.String("config"))
 		return nil
 	}
 	app.Commands = []cli.Command{
@@ -40,8 +38,8 @@ func InitArgs() {
 				myargs := make(map[string]string)
 				myargs["file"] = c.Args().First()
 				rc := RedisSnapShot(myargs)
-				fmt.Println(c.String("file"))
-				err = rc.TakeSnapShot(c.String("file"))
+				defer rc.CloseAll()
+				err = rc.Restore()
 
 				return
 
@@ -61,7 +59,7 @@ func InitArgs() {
 				myargs := make(map[string]string)
 				myargs["host"] = c.Args().First()
 				rc := RedisSnapShot(myargs)
-				fmt.Println(c.String("file"))
+				defer rc.CloseAll()
 				err = rc.TakeSnapShot(c.String("file"))
 				return nil
 			},
@@ -107,6 +105,7 @@ func InitArgs() {
 					return
 				}
 				rc := RedisSnapShot(myargs)
+				defer rc.CloseAll()
 				err = rc.ForgetAll(rc.runNodes[c.Args().First()])
 				return
 			},
